@@ -424,7 +424,7 @@ def launch(args, distance, tag):
         if "enableVsync:false\n" not in text:
             raise RuntimeError("perf_bench's options no longer set enableVsync:false")
         options.write_text(text.replace("enableVsync:false\n", "enableVsync:true\n"))
-    sock = Path("/tmp") / f"horizon-pacing-{os.getpid()}{tag}.sock"
+    sock = pb.control_path()
     sock.unlink(missing_ok=True)
     client = Path(args.build).resolve() / "horizon-client"
     command = [str(client), "--resources", str(Path(args.resources).resolve()), "--control-socket", str(sock),

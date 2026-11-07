@@ -77,6 +77,7 @@ impl PageRuns {
         pages: &mut [(u32, Option<u32>)],
         base: usize,
     ) -> &[Run] {
+        let _span = crate::spans::guard("r_regroup");
         // Group and page: one of each needs no reordering.
         let page = |r: &Run| r.key & (3 << GROUP_SHIFT | u64::from(u32::MAX));
         if self.runs.windows(2).all(|w| page(&w[0]) == page(&w[1])) {

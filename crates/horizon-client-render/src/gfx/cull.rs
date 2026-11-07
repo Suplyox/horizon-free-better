@@ -394,7 +394,18 @@ impl Cull {
     /// Start a frame: take in the results that came back, and tell whether
     /// the frame culls.
     pub fn begin(&mut self, device: &wgpu::Device) -> bool {
-        let _ = device.poll(wgpu::PollType::Poll);
+        let _readback = crate::spans::guard("r_cull_readback");
+        // Open views only probe occasionally. With no mapping in flight,
+        // polling cannot produce a culling result, but can still retire other
+        // GPU work and stall this frame. Each readback stays PENDING until its
+        // mapping callback runs, so keep polling while a result is on its way.
+        if self
+            .readbacks
+            .iter()
+            .any(|r| r.state.load(Ordering::Acquire) == PENDING)
+        {
+            let _ = crate::spans::time("r_cull_poll", || device.poll(wgpu::PollType::Poll));
+        }
         for i in 0..READBACKS {
             let r = &mut self.readbacks[(self.next + i) % READBACKS];
             if r.state.load(Ordering::Acquire) != MAPPED {
@@ -426,7 +437,7 @@ impl Cull {
                     seen[slot] = result == r.stamp;
                 }
             }
-            r.buffer.unmap();
+            crate::spans::time("r_cull_unmap", || r.buffer.unmap());
             r.state.store(FREE, Ordering::Release);
         }
         self.stamp = self.stamp.wrapping_add(1).max(1);
@@ -733,6 +744,61 @@ fn source(depth_test: DepthTest) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_readbacks_progress_and_idle_frames_do_not_poll() {
+        let instance = super::super::test_gpu::instance();
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+            eprintln!("no GPU adapter: skipped");
+            return;
+        };
+        let features = Cull::features(&adapter) | wgpu::Features::INDIRECT_FIRST_INSTANCE;
+        let Ok((device, queue)) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                required_features: features,
+                ..Default::default()
+            }))
+        else {
+            eprintln!("no culling device: skipped");
+            return;
+        };
+        let Some(depth_test) = Cull::supported(&adapter, &device) else {
+            eprintln!("culling unavailable: skipped");
+            return;
+        };
+        let mut cull = Cull::new(&device, wgpu::TextureFormat::Bgra8Unorm, depth_test);
+        let r = &mut cull.readbacks[0];
+        r.buffer = buffer(&device, "Culling readback test", 8, READBACK_USAGE);
+        r.slots = vec![0, TILE | 1];
+        r.indices = vec![6, 6];
+        r.total = 12;
+        r.stamp = 1;
+        queue.write_buffer(&r.buffer, 0, bytemuck::cast_slice(&[1u32, 0]));
+        queue.submit([]);
+        let state = r.state.clone();
+        cull.current = Some(0);
+        cull.submitted().expect("queued readback")();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while state.load(Ordering::Acquire) != FREE {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "readback did not complete"
+            );
+            cull.begin(&device);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(cull.seen[0]);
+        assert!(!cull.seen_tiles[1]);
+        assert_eq!(cull.hidden, ([1, 2], 0.5));
+
+        crate::spans::take_raw();
+        crate::spans::record_here(true);
+        cull.begin(&device);
+        crate::spans::record_here(false);
+        let spans = crate::spans::take_raw();
+        assert!(!spans.iter().any(|span| span.name == "r_cull_poll"));
+        assert!(cull.seen[0], "an idle frame keeps the previous result");
+    }
 
     /// Culling while the newest result hid enough; else one frame in `PROBE`
     /// tests every section. GPU culling's frames take the same gate.
